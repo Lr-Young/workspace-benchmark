@@ -1,0 +1,9 @@
+.venv/
+code/
+__pycache__/
+xlsx/
+
+*.out
+*.txt
+data.json
+.DS_Store
