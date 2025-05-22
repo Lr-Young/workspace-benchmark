@@ -41,9 +41,9 @@ Strictly adhere to this structure (no free-form text):
 
 ### Evaluation Dimensions (Total: 10 points)
 - 1. [Technical element 1 description] (x points): [Exact canonical answer excerpt]
-- 2. [Technical element 2 description] (y points): [Exact canonical answer excerpt]
-- 3. [Technical element 3 description] (y points): [Exact canonical answer excerpt](if exist)
-- 4. [Technical element 4 description] (y points): [Exact canonical answer excerpt](if exist)
+- 2. [Technical element 2 description] (x points): [Exact canonical answer excerpt]
+- 3. [Technical element 3 description] (x points): [Exact canonical answer excerpt](if exist)
+- 4. [Technical element 4 description] (x points): [Exact canonical answer excerpt](if exist)
 ...
 '''
     return answer_points_promt

@@ -1,5 +1,6 @@
 
 from numpy import place
+import numpy as np
 from openai import OpenAI  
 import pandas as pd
 import re
@@ -7,12 +8,25 @@ import yaml
 import json
 import tqdm
 from pathlib import Path
+import time
+import hashlib
+import requests
+import dashscope
+from http import HTTPStatus
+import json
+
+from spec_retriever import *
 
 from prompt import *
 
 api_key = "sk-3gZ5uUx0IFUWKCeiC7Fa223b5dE34840Aa8cF5D06574Df09"  # 请替换为您的 API Key  
 api_base = "http://maas-api.cn-huabei-1.xf-yun.com/v1"  
 client = None
+
+
+API_KEY = 'sk-b93acb44de69499bb467ca611357a412'
+dashscope.api_key = API_KEY
+
 
 def llm(prompt: str) -> str:
     global client
@@ -35,7 +49,60 @@ def llm(prompt: str) -> str:
     except Exception as e:
         print(f"Error: {e}")
         return ''
+    
 
+def en_to_zh(text: str):
+    # 百度翻译API配置信息
+    APP_ID = '20241202002217278'
+    SECRET_KEY = 'U4a4zoQNEWesL6pbr4Zx'
+
+    url = "http://api.fanyi.baidu.com/api/trans/vip/translate"
+    salt = str(time.time())
+    sign = hashlib.md5((APP_ID + text + salt + SECRET_KEY).encode('utf-8')).hexdigest()
+    params = {
+        'q': text,
+        'from': 'en',
+        'to': 'zh',
+        'appid': APP_ID,
+        'salt': salt,
+        'sign': sign
+    }
+    response = requests.get(url, params=params)
+    result = response.json()
+
+    # 添加错误处理和日志记录
+    if 'trans_result' in result:
+        translations = [item['dst'] for item in result['trans_result']]
+        # 将翻译结果按行拼接起来
+        translated_text = '\n'.join(translations)
+        return translated_text
+    else:
+        # 打印错误信息和完整的API响应
+        print(f"翻译API响应错误: {result}")
+        return text  # 如果翻译失败，返回原文
+    
+
+def str_to_embedding(text: str) -> list:
+    resp = dashscope.TextEmbedding.call(
+        model=dashscope.TextEmbedding.Models.text_embedding_v3,
+        input=text)
+    if resp.status_code == HTTPStatus.OK:
+        embedding = resp.get('output').get('embeddings')[0].get('embedding')
+        return embedding
+    else:
+        print(resp)
+        return None
+
+
+def cosine_similarity(vector1, vector2):
+    dot_product = np.dot(vector1, vector2)
+    norm_vector1 = np.linalg.norm(vector1)
+    norm_vector2 = np.linalg.norm(vector2)
+    return dot_product / (norm_vector1 * norm_vector2)
+
+
+def text_cosine_similarity(text1: str, text2: str):
+    return cosine_similarity(str_to_embedding(text1), str_to_embedding(text2))
 
 def parse_placeholders():
     df = pd.read_excel('question_type.xlsx', header=None)
@@ -129,21 +196,25 @@ def extract_answer_from_think(text: str):
     else:
         print("extract_answer_from_think wrong!\n" + text)
         exit(1)
-    
 
 def extract_answer_and_points(raw_answer: str):
     raw_answer = raw_answer.strip()
     pattern1 = r'### Canonical Answer'
     pattern2 = r'### Evaluation Dimensions \(Total: 10 points\)'
     
+    if not re.search(pattern1, raw_answer):
+        pattern1 = r'Canonical Answer'
+    if not re.search(pattern2, raw_answer):
+        pattern2 = r'Evaluation Dimensions \(Total: 10 points\)'
+    
     match1 = re.search(pattern1, raw_answer)
     match2 = re.search(pattern2, raw_answer)
 
     if not match1:
-        print("extract_answer_and_points wrong!\n" + raw_answer)
+        print("extract_answer_and_points wrong!\n" + pattern1 + " not found\n" + raw_answer)
         exit(1)
     if not match2:
-        print("extract_answer_and_points wrong!\n" + raw_answer)
+        print("extract_answer_and_points wrong!\n" + pattern2 + " not found\n" + raw_answer)
         exit(1)
     
     answer = raw_answer.split(match2.group(0))[0].split(match1.group(0))[1].strip()
@@ -252,6 +323,19 @@ def delete_column(data_frame: pd.DataFrame, column_title: str):
         data_frame.drop(column_title, axis=1, inplace=True)
 
 
+def translate_column(data_frame: pd.DataFrame, column_title: str):
+    translate_title = column_title + '-translate'
+    if column_title in data_frame.columns:
+        delete_column(data_frame, translate_title)
+        insert_column_right(data_frame, column_title, translate_title)
+        for i in range(len(data_frame)):
+            content = data_frame.loc[i, column_title]
+            translated_content = en_to_zh(content)
+            data_frame.loc[i, translate_title] = translated_content
+
+
+
+# 生成 从原始答案到标准答案的提示词
 def generate_dataset_answer_prompt(file_name):
     df = pd.read_excel(file_name)
     reset_column(df, 'answer_prompt')
@@ -263,6 +347,7 @@ def generate_dataset_answer_prompt(file_name):
     df.to_excel(file_name, index=False)
 
 
+# 生成 各个待评估 LLM 的原始答案的评估提示词和评估结果
 def generate_dataset(file_name, model_names: list[str], reset: bool):
     df = pd.read_excel(file_name)
     if reset:
@@ -282,12 +367,7 @@ def generate_dataset(file_name, model_names: list[str], reset: bool):
             insert_column_right(df, model_name, scroe_column)
             insert_column_right(df, model_name, output_column)
             insert_column_right(df, model_name, prompt_column)
-
-        reset_column(df, 'answer')
-        reset_column(df, 'points')
     for i in tqdm.tqdm(range(len(df))):
-        if i < 19:
-            continue
         question = df.loc[i, 'question']
         raw_answer = df.loc[i, 'raw_answer']
         answer, points = extract_answer_and_points(raw_answer)
@@ -295,6 +375,8 @@ def generate_dataset(file_name, model_names: list[str], reset: bool):
         df.loc[i, 'points'] = points
         
         for model_name in tqdm.tqdm(model_names):
+            if pd.isna(df.loc[i, model_name]):
+                continue
             candidate_answer = df.loc[i, model_name]
             candidate_answer = extract_answer_from_think(candidate_answer)
             evaluation_prompt = get_evaluation_prompt(question, answer, points.strip().split('\n'), candidate_answer)
@@ -303,11 +385,207 @@ def generate_dataset(file_name, model_names: list[str], reset: bool):
 
             df.loc[i, model_name + '-evaluation-prompt'] = evaluation_prompt
             df.loc[i, model_name + '-evaluation-output'] = evaluation_outcome
-            df.loc[i, model_name + '-score'] = point
+            df.loc[i, model_name + '-score'] = float(point)
             df.loc[i, model_name + '-evaluation'] = evaluation
             df.to_excel(file_name, index=False)
     
     df.to_excel(file_name, index=False)
 
+
+def get_average_point(file_name, model_names: list[str]):
+    df = pd.read_excel(file_name)
+    points = dict()
+    for model_name in model_names:
+        if model_name not in df.columns:
+            print(f"{model_name} is not a column in table!\n")
+            exit(1)
+        if model_name + '-score' not in df.columns:
+            print(f"{model_name}-score is not a column in table!\n")
+            exit(1)
+        sum = float(0)
+        for i in range(len(df)):
+            sum += float(df.loc[i, model_name + '-score'])
+        points[model_name] = sum / len(df)
+    return points
+
+
+def get_average_embedding(file_name, model_names: list[str]):
+    df = pd.read_excel(file_name)
+    points = dict()
+    for model_name in model_names:
+        if model_name not in df.columns:
+            print(f"{model_name} is not a column in table!\n")
+            exit(1)
+        if model_name + '-embedding-similarity' not in df.columns:
+            print(f"{model_name}-embedding-similarity is not a column in table!\n")
+            exit(1)
+        sum = float(0)
+        for i in range(len(df)):
+            sum += float(df.loc[i, model_name + '-embedding-similarity'])
+        points[model_name] = sum / len(df)
+    return points
+
+
+def get_model_point(file_name, model_names: list[str]):
+    df = pd.read_excel(file_name)
+    points = dict()
+    for model_name in model_names:
+        scores = list()
+        if model_name not in df.columns:
+            print(f"{model_name} is not a column in table!\n")
+            exit(1)
+        if model_name + '-score' not in df.columns:
+            print(f"{model_name}-score is not a column in table!\n")
+            exit(1)
+        for i in range(len(df)):
+            scores.append(float(df.loc[i, model_name + '-score']))
+        points[model_name] = scores
+    return points
+
+
+def generate_translation(file_name, model_names: list[str]):
+    df = pd.read_excel(file_name)
+    for model_name in model_names:
+        translate_column(df, model_name)
+        translate_column(df, model_name + '-evaluation-output')
+    for column_title in ['answer', 'points']:
+        translate_column(df, column_title)
+        
+    file_path = Path(file_name)
+    dir_path = file_path.parent
+    output_file_name = dir_path.joinpath(file_path.stem + '-translated' + file_path.suffix)
+    df.to_excel(output_file_name, index=False)
+
+def violin_plot(model_scores: dict[str, list]):
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    import numpy as np
+
+    data = []
+
+    for [k,v] in model_scores.items():
+        avg_score = sum(v) / len(v)
+        for i, score in enumerate(v):
+            data.append({
+                'Model': k,
+                'Evaluation_Point': f'Point_{i + 1}',
+                'Score': score,
+                'Average_Score': avg_score
+            })
+
+    # 将数据转换为DataFrame
+    df = pd.DataFrame(data)
+
+    # 绘制小提琴图
+    plt.figure(figsize=(10, 6))
+    sns.violinplot(x='Model', y='Score', data=df)
+    plt.title('Evaluation Scores Distribution for Each Model')
+    plt.xlabel('Model')
+    plt.ylabel('Score')
+    plt.show()
+
+
+def generate_embedding_points(file_name: str, model_names: list[str]):
+    df = pd.read_excel(file_name)
+    for model_name in model_names:
+        if not model_name in df.columns:
+            print(model_name + " is not in column titles")
+            exit(1)
+        embedding_column = model_name + '-embedding-similarity'
+        delete_column(df, embedding_column)
+        insert_column_right(df, model_name, embedding_column)
+    for i in tqdm.tqdm(range(len(df))):
+        answer = df.loc[i, 'answer']
+        for model_name in model_names:
+            candidate_answer = df.loc[i, model_name]
+            candidate_answer = extract_answer_from_think(candidate_answer)
+            df.loc[i, model_name + '-embedding-similarity'] = text_cosine_similarity(answer, candidate_answer)
+    df.to_excel(file_name, index=False)
+
+
+def get_questions(file_name: str):
+    df = pd.read_excel(file_name)
+    questions = []
+    for i in range(len(df)):
+        questions.append(df.loc[i, 'question'])
+    return questions
+
+
+def calculate_context(file_name: str, cursor_output_file: str):
+    with open(cursor_output_file, 'r') as f:
+        text = f.read()
+    questions, refs, answers = retrieve_spec(text)
+    df = pd.read_excel(file_name)
+
+    reset_column(df, 'cursor context')
+    reset_column(df, 'recall')
+    reset_column(df, 'precision')
+    reset_column(df, 'f1')
+    reset_column(df, 'soft-recall')
+    reset_column(df, 'soft-precision')
+    reset_column(df, 'soft-f1')
+    
+    for i in range(len(questions)):
+        if pd.isna(df.loc[i, 'context']):
+            continue
+        context = df.loc[i, 'context']
+        gt_ref = FileRange.from_list(context.strip().split('\n'))
+        ref = refs[i]
+        if len(ref) == 0:
+            continue
+        
+        cursor_context = ''
+        for e in ref:
+            cursor_context += str(e) + '\n'
+        df.loc[i, 'cursor context'] = cursor_context
+
+        df.loc[i, 'recall'] = calculate_recall(gt_ref, ref, False)
+        df.loc[i, 'precision'] = calculate_precision(gt_ref, ref, False)
+        df.loc[i, 'f1'] = calculate_f1(gt_ref, ref, False)
+        df.loc[i, 'soft-recall'] = calculate_recall(gt_ref, ref, True)
+        df.loc[i, 'soft-precision'] = calculate_precision(gt_ref, ref, True)
+        df.loc[i, 'soft-f1'] = calculate_f1(gt_ref, ref, True)
+    
+    df.to_excel(file_name, index=False)
+
+
+# model_scores = dict()
+
+# model_scores['model_A'] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+# model_scores['model_B'] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+# model_scores['model_C'] = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10]
+# model_scores['model_D'] = [10, 10, 10, 10, 9]
+# model_scores['model_E'] = [5, 5, 5, 1]
+
+
+# violin_plot(model_scores)
+
 # generate_dataset_answer_prompt('xlsx/tmp.xlsx')
-generate_dataset('xlsx/tmp.xlsx', ['deepseek-R1', 'deepseek-V3', 'gpt-4o', 'claude-3.7-sonnet'], False)
+file = 'xlsx/benchmark-cutlass-80-context.xlsx'
+models = ['huawei-workspace-agents']
+# models = ['huawei-workspace-agents']
+# generate_dataset('xlsx/benchmark-cutlass-20.xlsx', models, False)
+
+# print(get_average_point('xlsx/benchmark-cutlass-20.xlsx', models))
+# print(get_model_point('xlsx/benchmark-cutlass-20.xlsx', models))
+
+# violin_plot(get_model_point('xlsx/benchmark-cutlass-20.xlsx', models))
+
+
+# generate_translation('xlsx/benchmark-cutlass-20.xlsx', models)
+# generate_embedding_points('xlsx/benchmark-cutlass-20.xlsx', models)
+
+
+# generate_dataset_answer_prompt(file)
+
+# file = 'xlsx/benchmark-cutlass-80.xlsx'
+# models = ['deepseek-R1', 'deepseek-V3', 'gpt-4o', 'claude-3.7-sonnet']
+# # generate_dataset(file, models, True)
+# violin_plot(get_model_point(file, models))
+
+# generate_dataset(file, models, True)
+
+calculate_context(file, 'tmp.txt')
+
+
